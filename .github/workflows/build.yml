@@ -1,4 +1,5 @@
-name: Build APK
+
+name: Build APK and Deploy Firebase Hosting
 
 on:
   push:
@@ -11,17 +12,25 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Unzip project and find Gradle root
         shell: bash
         run: |
           set -euo pipefail
 
+          ARCHIVE="maxim-android-project.zip"
+          if [ ! -s "$ARCHIVE" ]; then
+            echo "ERROR: $ARCHIVE was not found in the repository root."
+            exit 1
+          fi
+
           mkdir -p project
-          unzip -q -o maxim-android-project.zip -d project
+          unzip -q -o "$ARCHIVE" -d project
 
           echo "=== Searching for Gradle project ==="
           find project -type f \
@@ -42,7 +51,7 @@ jobs:
           echo "Gradle project found at: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      - name: Find and validate Firebase config
+      - name: Find and validate Firebase Android config
         shell: bash
         run: |
           set -euo pipefail
@@ -61,29 +70,19 @@ jobs:
               cp "$SOURCE" "$TARGET"
             else
               ARCHIVE="maxim-android-project.zip"
-
-              if [ -f "$ARCHIVE" ]; then
-                INNER="$(unzip -Z1 "$ARCHIVE" \
-                  | grep -E '(^|/)google-services\.json$' \
-                  | head -n 1 || true)"
-
-                if [ -n "$INNER" ]; then
-                  echo "Extracting Firebase config from ZIP"
-                  unzip -p "$ARCHIVE" "$INNER" > "$TARGET"
-                else
-                  echo "ERROR: JSON not found inside ZIP."
-                  exit 1
-                fi
+              INNER="$(unzip -Z1 "$ARCHIVE" | grep -E '(^|/)google-services\.json$' | head -n 1 || true)"
+              if [ -n "$INNER" ]; then
+                echo "Extracting Firebase config from ZIP"
+                unzip -p "$ARCHIVE" "$INNER" > "$TARGET"
               else
-                echo "ERROR: JSON and project ZIP not found."
+                echo "ERROR: google-services.json was not found."
                 exit 1
               fi
             fi
           fi
 
           python3 -m json.tool "$TARGET" >/dev/null
-
-          python3 - "$TARGET" <<'PY'
+          python3 - "$TARGET" <<'PYTHON'
           import json
           import sys
 
@@ -93,26 +92,24 @@ jobs:
           assert config.get("project_info", {}).get("project_id") == "maxim-calc", \
               "Firebase project_id does not match maxim-calc"
 
-          clients = config.get("client", [])
           packages = [
-              item.get("client_info", {})
-                  .get("android_client_info", {})
-                  .get("package_name")
-              for item in clients
+              item.get("client_info", {}).get("android_client_info", {}).get("package_name")
+              for item in config.get("client", [])
           ]
-
           assert "com.maximcalc.app" in packages, \
               "Package com.maximcalc.app not found in Firebase config"
 
-          print("Firebase JSON validated successfully.")
-          PY
+          print("Firebase Android JSON validated successfully.")
+          PYTHON
 
-      - uses: actions/setup-java@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
@@ -151,7 +148,76 @@ jobs:
 
           APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
           cp "$APK" maxim.apk
+          TAG="v${GITHUB_RUN_NUMBER}"
 
-          gh release create "v${{ github.run_number }}" maxim.apk \
-            --title "Maxim APK ${{ github.run_number }}" \
-            --notes "Maxim calculator release APK"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" maxim.apk --clobber
+          else
+            gh release create "$TAG" maxim.apk \
+              --title "Maxim APK ${GITHUB_RUN_NUMBER}" \
+              --notes "Maxim calculator release APK. Build and tests completed in GitHub Actions."
+          fi
+
+  deploy-hosting:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract project and find Firebase Hosting config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="maxim-android-project.zip"
+          if [ ! -s "$ARCHIVE" ]; then
+            echo "ERROR: $ARCHIVE was not found in the repository root."
+            exit 1
+          fi
+
+          mkdir -p project
+          unzip -q -o "$ARCHIVE" -d project
+
+          FIREBASE_CONFIG="$(find project -type f -name firebase.json -print -quit)"
+          if [ -z "$FIREBASE_CONFIG" ]; then
+            echo "ERROR: firebase.json was not found in the extracted project."
+            exit 1
+          fi
+
+          FIREBASE_DIR="$(dirname "$FIREBASE_CONFIG")"
+          if [ ! -d "$FIREBASE_DIR/hosting" ]; then
+            echo "ERROR: Hosting folder not found: $FIREBASE_DIR/hosting"
+            exit 1
+          fi
+          if [ ! -s "$FIREBASE_DIR/.firebaserc" ]; then
+            echo "ERROR: .firebaserc not found next to firebase.json."
+            exit 1
+          fi
+
+          echo "FIREBASE_DIR=$FIREBASE_DIR" >> "$GITHUB_ENV"
+          echo "Firebase Hosting directory: $FIREBASE_DIR"
+
+      - name: Setup Node.js for Firebase CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Authenticate to Google Cloud / Firebase
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: maxim-calc
+          credentials_json: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_MAXIM_CALC }}'
+
+      - name: Install Firebase CLI
+        shell: bash
+        run: npm install --global firebase-tools
+
+      - name: Deploy Firebase Hosting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$FIREBASE_DIR"
+          firebase use maxim-calc
+          firebase deploy --only hosting --project maxim-calc --non-interactive
