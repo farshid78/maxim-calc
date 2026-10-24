@@ -1,16 +1,28 @@
 
+
 name: Build APK and Deploy Firebase Hosting
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: maxim-main-deploy
+  cancel-in-progress: false
+
+env:
+  FIREBASE_PROJECT_ID: maxim-calc
+  ANDROID_PACKAGE_NAME: com.maximcalc.app
+  ARCHIVE_NAME: maxim-android-project.zip
+
 jobs:
   build:
+    name: Test and Build Android APKs
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -18,40 +30,39 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Unzip project and find Gradle root
+      - name: Validate and extract Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE="maxim-android-project.zip"
-          if [ ! -s "$ARCHIVE" ]; then
-            echo "ERROR: $ARCHIVE was not found in the repository root."
+          if [ ! -s "$ARCHIVE_NAME" ]; then
+            echo "::error::Missing $ARCHIVE_NAME in repository root."
             exit 1
           fi
 
           mkdir -p project
-          unzip -q -o "$ARCHIVE" -d project
+          unzip -q -o "$ARCHIVE_NAME" -d project
 
-          echo "=== Searching for Gradle project ==="
-          find project -type f \
-            \( -name settings.gradle -o -name settings.gradle.kts \) \
-            -print
-
-          SETTINGS="$(find project -type f \
+          SETTINGS_FILE="$(find project -type f \
             \( -name settings.gradle -o -name settings.gradle.kts \) \
             -print -quit)"
 
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: settings.gradle was not found in the ZIP."
-            find project -maxdepth 5 -type f | sort | head -200
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::Gradle settings file not found in ZIP."
             exit 1
           fi
 
-          PROJECT_DIR="$(dirname "$SETTINGS")"
-          echo "Gradle project found at: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
 
-      - name: Find and validate Firebase Android config
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::error::Android app directory not found: $PROJECT_DIR/app"
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project: $PROJECT_DIR"
+
+      - name: Locate and validate google-services.json
         shell: bash
         run: |
           set -euo pipefail
@@ -60,93 +71,133 @@ jobs:
           mkdir -p "$(dirname "$TARGET")"
 
           if [ ! -s "$TARGET" ]; then
-            SOURCE="$(find . -type f -name 'google-services.json' \
-              -not -path './.git/*' \
-              -not -path "$TARGET" \
-              -print -quit || true)"
+            SOURCE="$(find project -type f \
+              -name google-services.json -print -quit || true)"
 
             if [ -n "$SOURCE" ]; then
-              echo "Found Firebase config: $SOURCE"
               cp "$SOURCE" "$TARGET"
             else
-              ARCHIVE="maxim-android-project.zip"
-              INNER="$(unzip -Z1 "$ARCHIVE" \
+              INNER="$(unzip -Z1 "$ARCHIVE_NAME" \
                 | grep -E '(^|/)google-services\.json$' \
                 | head -n 1 || true)"
 
-              if [ -n "$INNER" ]; then
-                echo "Extracting Firebase config from ZIP"
-                unzip -p "$ARCHIVE" "$INNER" > "$TARGET"
-              else
-                echo "ERROR: google-services.json was not found."
+              if [ -z "$INNER" ]; then
+                echo "::error::google-services.json not found."
                 exit 1
               fi
+
+              unzip -p "$ARCHIVE_NAME" "$INNER" > "$TARGET"
             fi
           fi
 
-          python3 -m json.tool "$TARGET" >/dev/null
-
-          python3 - "$TARGET" <<'PYTHON'
+          python3 - "$TARGET" "$FIREBASE_PROJECT_ID" \
+            "$ANDROID_PACKAGE_NAME" <<'PYTHON'
           import json
           import sys
 
-          with open(sys.argv[1], encoding="utf-8") as f:
+          path, expected_project, expected_package = sys.argv[1:]
+
+          with open(path, encoding="utf-8") as f:
               config = json.load(f)
 
-          assert config.get("project_info", {}).get("project_id") == "maxim-calc", \
-              "Firebase project_id does not match maxim-calc"
+          actual_project = config.get("project_info", {}).get("project_id")
+          if actual_project != expected_project:
+              raise SystemExit(
+                  f"Expected Firebase project {expected_project}, "
+                  f"but google-services.json contains {actual_project}"
+              )
 
           packages = [
-              item.get("client_info", {})
-                  .get("android_client_info", {})
-                  .get("package_name")
-              for item in config.get("client", [])
+              client.get("client_info", {})
+                    .get("android_client_info", {})
+                    .get("package_name")
+              for client in config.get("client", [])
           ]
 
-          assert "com.maximcalc.app" in packages, \
-              "Package com.maximcalc.app not found in Firebase config"
+          if expected_package not in packages:
+              raise SystemExit(
+                  f"Package {expected_package} not found in Firebase config."
+              )
 
-          print("Firebase Android JSON validated successfully.")
+          print("Firebase Android configuration validated.")
           PYTHON
 
-      - name: Setup Java
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            **/*.gradle*
+            **/gradle-wrapper.properties
 
-      - name: Setup Gradle
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: "8.9"
 
-      - name: Unit tests
+      - name: Run unit tests
         shell: bash
         run: |
           set -euo pipefail
-          gradle -p "$PROJECT_DIR" testDebugUnitTest --no-daemon
 
-      - name: Build debug and release APKs
+          if [ -f "$PROJECT_DIR/gradlew" ]; then
+            chmod +x "$PROJECT_DIR/gradlew"
+            "$PROJECT_DIR/gradlew" \
+              -p "$PROJECT_DIR" testDebugUnitTest --no-daemon
+          else
+            gradle -p "$PROJECT_DIR" \
+              testDebugUnitTest --no-daemon
+          fi
+
+      - name: Build Debug and Release APKs
         shell: bash
         run: |
           set -euo pipefail
-          gradle -p "$PROJECT_DIR" assembleDebug assembleRelease --no-daemon
 
-      - name: Upload debug APK
+          if [ -f "$PROJECT_DIR/gradlew" ]; then
+            "$PROJECT_DIR/gradlew" \
+              -p "$PROJECT_DIR" \
+              assembleDebug assembleRelease --no-daemon
+          else
+            gradle -p "$PROJECT_DIR" \
+              assembleDebug assembleRelease --no-daemon
+          fi
+
+          DEBUG_APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          RELEASE_APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
+
+          if [ ! -s "$DEBUG_APK" ]; then
+            echo "::error::Debug APK was not generated."
+            exit 1
+          fi
+
+          if [ ! -s "$RELEASE_APK" ]; then
+            echo "::error::Release APK was not generated."
+            exit 1
+          fi
+
+          echo "Both APKs were generated."
+          ls -lh "$DEBUG_APK" "$RELEASE_APK"
+
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: maxim-debug-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Upload release APK
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: maxim-release-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+          retention-days: 30
 
-      - name: Publish release
+      - name: Publish APK to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -155,6 +206,7 @@ jobs:
 
           APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
           cp "$APK" maxim.apk
+
           TAG="v${GITHUB_RUN_NUMBER}"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -162,111 +214,137 @@ jobs:
           else
             gh release create "$TAG" maxim.apk \
               --title "Maxim APK ${GITHUB_RUN_NUMBER}" \
-              --notes "Maxim calculator release APK. Build and tests completed in GitHub Actions."
+              --notes "Android APK built by GitHub Actions."
           fi
 
   deploy-hosting:
+    name: Deploy Firebase Hosting
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract project and find Firebase Hosting config
+      - name: Extract and validate Firebase Hosting project
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE="maxim-android-project.zip"
-          if [ ! -s "$ARCHIVE" ]; then
-            echo "ERROR: $ARCHIVE was not found in the repository root."
+          if [ ! -s "$ARCHIVE_NAME" ]; then
+            echo "::error::Missing $ARCHIVE_NAME in repository root."
             exit 1
           fi
 
           mkdir -p project
-          unzip -q -o "$ARCHIVE" -d project
+          unzip -q -o "$ARCHIVE_NAME" -d project
 
-          FIREBASE_CONFIG="$(find project -type f -name firebase.json -print -quit)"
+          FIREBASE_CONFIG="$(find project -type f \
+            -name firebase.json -print -quit)"
 
           if [ -z "$FIREBASE_CONFIG" ]; then
-            echo "ERROR: firebase.json was not found in the extracted project."
+            echo "::error::firebase.json not found in ZIP."
             exit 1
           fi
 
           FIREBASE_DIR="$(dirname "$FIREBASE_CONFIG")"
-          echo "FIREBASE_DIR=$FIREBASE_DIR" >> "$GITHUB_ENV"
-          echo "Firebase configuration found: $FIREBASE_CONFIG"
+          FIREBASERC="$FIREBASE_DIR/.firebaserc"
 
-          python3 - "$FIREBASE_CONFIG" "$FIREBASE_DIR" <<'PYTHON'
+          if [ ! -s "$FIREBASERC" ]; then
+            echo "::error::.firebaserc not found beside firebase.json."
+            exit 1
+          fi
+
+          python3 - "$FIREBASE_CONFIG" "$FIREBASERC" \
+            "$FIREBASE_DIR" "$FIREBASE_PROJECT_ID" <<'PYTHON'
           import json
           import os
           import sys
 
-          config_path, base_dir = sys.argv[1], sys.argv[2]
+          config_path, rc_path, base_dir, expected_project = sys.argv[1:]
 
           with open(config_path, encoding="utf-8") as f:
               config = json.load(f)
 
-          hosting = config.get("hosting")
+          with open(rc_path, encoding="utf-8") as f:
+              rc = json.load(f)
 
-          if isinstance(hosting, list):
-              entries = hosting
-          elif isinstance(hosting, dict):
+          hosting = config.get("hosting")
+          if isinstance(hosting, dict):
               entries = [hosting]
+          elif isinstance(hosting, list) and hosting:
+              entries = hosting
           else:
               raise SystemExit(
-                  "ERROR: firebase.json has no valid 'hosting' configuration."
+                  "firebase.json has no valid Hosting configuration."
               )
-
-          public_dirs = []
 
           for entry in entries:
-              if not isinstance(entry, dict) or not entry.get("public"):
+              public_dir = entry.get("public") if isinstance(entry, dict) else None
+              if not public_dir:
                   raise SystemExit(
-                      "ERROR: Hosting configuration must define a 'public' directory."
+                      "Each Hosting configuration must define 'public'."
                   )
 
-              public_dir = os.path.abspath(
-                  os.path.join(base_dir, entry["public"])
+              full_path = os.path.abspath(
+                  os.path.join(base_dir, public_dir)
               )
 
-              if not os.path.isdir(public_dir):
+              if not os.path.isdir(full_path):
                   raise SystemExit(
-                      f"ERROR: Hosting public directory does not exist: {public_dir}"
+                      f"Hosting public directory does not exist: {full_path}"
                   )
 
-              public_dirs.append(public_dir)
+              if not any(os.scandir(full_path)):
+                  raise SystemExit(
+                      f"Hosting public directory is empty: {full_path}"
+                  )
 
-          print("Hosting public directories validated:")
-          for directory in public_dirs:
-              print(f" - {directory}")
+          aliases = rc.get("projects", {})
+          default_project = aliases.get("default")
+
+          print(f"Target Firebase project: {expected_project}")
+          print(f".firebaserc default alias: {default_project}")
+          print("Hosting configuration validated.")
           PYTHON
 
-      - name: Setup Node.js for Firebase CLI
+          echo "FIREBASE_DIR=$FIREBASE_DIR" >> "$GITHUB_ENV"
+          echo "Firebase config: $FIREBASE_CONFIG"
+
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
-      - name: Authenticate to Google Cloud / Firebase
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           project_id: maxim-calc
-          credentials_json: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_MAXIM_CALC }}'
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_MAXIM_CALC }}
 
       - name: Install Firebase CLI
         shell: bash
         run: npm install --global firebase-tools
 
+      - name: Check Firebase access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          firebase projects:list --non-interactive
+
       - name: Deploy Firebase Hosting
         shell: bash
         run: |
           set -euo pipefail
+
           cd "$FIREBASE_DIR"
 
-          echo "Deploying Firebase Hosting to project maxim-calc..."
+          echo "Deploying Firebase Hosting to $FIREBASE_PROJECT_ID"
 
           firebase deploy \
             --only hosting \
-            --project maxim-calc \
+            --project "$FIREBASE_PROJECT_ID" \
             --non-interactive
+
+          echo "Firebase Hosting deployment completed."
