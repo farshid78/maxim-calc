@@ -1,47 +1,102 @@
 name: Build APK
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Unzip project
         run: unzip -q maxim-android-project.zip -d project
-      - name: Check Firebase config exists
-        run: test -f project/app/google-services.json || (echo "google-services.json is missing" && exit 1)
+
+      - name: Find and validate Firebase config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET="project/app/google-services.json"
+          mkdir -p "$(dirname "$TARGET")"
+
+          if [ ! -s "$TARGET" ]; then
+            SOURCE="$(find . -type f -name 'google-services.json' \
+              -not -path './.git/*' \
+              -not -path './project/app/google-services.json' \
+              -print -quit || true)"
+
+            if [ -n "$SOURCE" ]; then
+              echo "Found Firebase config: $SOURCE"
+              cp "$SOURCE" "$TARGET"
+            else
+              ARCHIVE="maxim-android-project.zip"
+
+              if [ -f "$ARCHIVE" ]; then
+                INNER="$(unzip -Z1 "$ARCHIVE" | grep -E '(^|/)google-services\.json$' | head -n 1 || true)"
+
+                if [ -n "$INNER" ]; then
+                  echo "Extracting Firebase config from ZIP"
+                  unzip -p "$ARCHIVE" "$INNER" > "$TARGET"
+                else
+                  echo "ERROR: JSON not found inside ZIP."
+                  exit 1
+                fi
+              else
+                echo "ERROR: JSON and project ZIP not found."
+                exit 1
+              fi
+            fi
+          fi
+
+          python3 -m json.tool "$TARGET" >/dev/null
+          grep -q '"project_id": "maxim-calc"' "$TARGET"
+          grep -q '"package_name": "com.maximcalc.app"' "$TARGET"
+
+          echo "Firebase JSON validated successfully."
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+
       - name: Unit tests
         working-directory: project
         run: gradle testDebugUnitTest --no-daemon
+
       - name: Build debug and release APKs
         working-directory: project
         run: gradle assembleDebug assembleRelease --no-daemon
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: maxim-debug-apk
           path: project/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
       - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
           name: maxim-release-apk
           path: project/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp project/app/build/outputs/apk/release/app-release.apk maxim.apk
-          gh release create "v${{ github.run_number }}" maxim.apk --title "Maxim APK ${{ github.run_number }}" --notes "Maxim calculator release APK"
+          gh release create "v${{ github.run_number }}" maxim.apk \
+            --title "Maxim APK ${{ github.run_number }}" \
+            --notes "Maxim calculator release APK"
