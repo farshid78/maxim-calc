@@ -70,7 +70,10 @@ jobs:
               cp "$SOURCE" "$TARGET"
             else
               ARCHIVE="maxim-android-project.zip"
-              INNER="$(unzip -Z1 "$ARCHIVE" | grep -E '(^|/)google-services\.json$' | head -n 1 || true)"
+              INNER="$(unzip -Z1 "$ARCHIVE" \
+                | grep -E '(^|/)google-services\.json$' \
+                | head -n 1 || true)"
+
               if [ -n "$INNER" ]; then
                 echo "Extracting Firebase config from ZIP"
                 unzip -p "$ARCHIVE" "$INNER" > "$TARGET"
@@ -82,6 +85,7 @@ jobs:
           fi
 
           python3 -m json.tool "$TARGET" >/dev/null
+
           python3 - "$TARGET" <<'PYTHON'
           import json
           import sys
@@ -93,9 +97,12 @@ jobs:
               "Firebase project_id does not match maxim-calc"
 
           packages = [
-              item.get("client_info", {}).get("android_client_info", {}).get("package_name")
+              item.get("client_info", {})
+                  .get("android_client_info", {})
+                  .get("package_name")
               for item in config.get("client", [])
           ]
+
           assert "com.maximcalc.app" in packages, \
               "Package com.maximcalc.app not found in Firebase config"
 
@@ -181,23 +188,60 @@ jobs:
           unzip -q -o "$ARCHIVE" -d project
 
           FIREBASE_CONFIG="$(find project -type f -name firebase.json -print -quit)"
+
           if [ -z "$FIREBASE_CONFIG" ]; then
             echo "ERROR: firebase.json was not found in the extracted project."
             exit 1
           fi
 
           FIREBASE_DIR="$(dirname "$FIREBASE_CONFIG")"
-          if [ ! -d "$FIREBASE_DIR/hosting" ]; then
-            echo "ERROR: Hosting folder not found: $FIREBASE_DIR/hosting"
-            exit 1
-          fi
-          if [ ! -s "$FIREBASE_DIR/.firebaserc" ]; then
-            echo "ERROR: .firebaserc not found next to firebase.json."
-            exit 1
-          fi
-
           echo "FIREBASE_DIR=$FIREBASE_DIR" >> "$GITHUB_ENV"
-          echo "Firebase Hosting directory: $FIREBASE_DIR"
+          echo "Firebase configuration found: $FIREBASE_CONFIG"
+
+          python3 - "$FIREBASE_CONFIG" "$FIREBASE_DIR" <<'PYTHON'
+          import json
+          import os
+          import sys
+
+          config_path, base_dir = sys.argv[1], sys.argv[2]
+
+          with open(config_path, encoding="utf-8") as f:
+              config = json.load(f)
+
+          hosting = config.get("hosting")
+
+          if isinstance(hosting, list):
+              entries = hosting
+          elif isinstance(hosting, dict):
+              entries = [hosting]
+          else:
+              raise SystemExit(
+                  "ERROR: firebase.json has no valid 'hosting' configuration."
+              )
+
+          public_dirs = []
+
+          for entry in entries:
+              if not isinstance(entry, dict) or not entry.get("public"):
+                  raise SystemExit(
+                      "ERROR: Hosting configuration must define a 'public' directory."
+                  )
+
+              public_dir = os.path.abspath(
+                  os.path.join(base_dir, entry["public"])
+              )
+
+              if not os.path.isdir(public_dir):
+                  raise SystemExit(
+                      f"ERROR: Hosting public directory does not exist: {public_dir}"
+                  )
+
+              public_dirs.append(public_dir)
+
+          print("Hosting public directories validated:")
+          for directory in public_dirs:
+              print(f" - {directory}")
+          PYTHON
 
       - name: Setup Node.js for Firebase CLI
         uses: actions/setup-node@v4
@@ -219,5 +263,10 @@ jobs:
         run: |
           set -euo pipefail
           cd "$FIREBASE_DIR"
-          firebase use maxim-calc
-          firebase deploy --only hosting --project maxim-calc --non-interactive
+
+          echo "Deploying Firebase Hosting to project maxim-calc..."
+
+          firebase deploy \
+            --only hosting \
+            --project maxim-calc \
+            --non-interactive
