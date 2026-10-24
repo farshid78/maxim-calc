@@ -1,5 +1,3 @@
-
-
 name: Build APK and Deploy Firebase Hosting
 
 on:
@@ -12,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: maxim-main-deploy
+  group: maxim-calc-main
   cancel-in-progress: false
 
 env:
@@ -25,10 +23,12 @@ jobs:
     name: Test and Build Android APKs
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Validate and extract Android project
         shell: bash
@@ -48,21 +48,21 @@ jobs:
             -print -quit)"
 
           if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::Gradle settings file not found in ZIP."
+            echo "::error::Gradle settings file was not found in the ZIP."
+            find project -maxdepth 5 -type f | sort | head -200
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-
           if [ ! -d "$PROJECT_DIR/app" ]; then
             echo "::error::Android app directory not found: $PROJECT_DIR/app"
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Android project: $PROJECT_DIR"
+          echo "Android project found: $PROJECT_DIR"
 
-      - name: Locate and validate google-services.json
+      - name: Find and validate Firebase Android config
         shell: bash
         run: |
           set -euo pipefail
@@ -71,8 +71,10 @@ jobs:
           mkdir -p "$(dirname "$TARGET")"
 
           if [ ! -s "$TARGET" ]; then
-            SOURCE="$(find project -type f \
-              -name google-services.json -print -quit || true)"
+            SOURCE="$(find . -type f -name google-services.json \
+              -not -path './.git/*' \
+              -not -path "$TARGET" \
+              -print -quit || true)"
 
             if [ -n "$SOURCE" ]; then
               cp "$SOURCE" "$TARGET"
@@ -82,7 +84,7 @@ jobs:
                 | head -n 1 || true)"
 
               if [ -z "$INNER" ]; then
-                echo "::error::google-services.json not found."
+                echo "::error::google-services.json was not found."
                 exit 1
               fi
 
@@ -90,21 +92,20 @@ jobs:
             fi
           fi
 
-          python3 - "$TARGET" "$FIREBASE_PROJECT_ID" \
-            "$ANDROID_PACKAGE_NAME" <<'PYTHON'
+          python3 -m json.tool "$TARGET" >/dev/null
+          python3 - "$TARGET" "$FIREBASE_PROJECT_ID" "$ANDROID_PACKAGE_NAME" <<'PYTHON'
           import json
           import sys
 
           path, expected_project, expected_package = sys.argv[1:]
-
           with open(path, encoding="utf-8") as f:
               config = json.load(f)
 
           actual_project = config.get("project_info", {}).get("project_id")
           if actual_project != expected_project:
               raise SystemExit(
-                  f"Expected Firebase project {expected_project}, "
-                  f"but google-services.json contains {actual_project}"
+                  f"Expected Firebase project '{expected_project}', "
+                  f"but google-services.json contains '{actual_project}'."
               )
 
           packages = [
@@ -113,17 +114,16 @@ jobs:
                     .get("package_name")
               for client in config.get("client", [])
           ]
-
           if expected_package not in packages:
               raise SystemExit(
-                  f"Package {expected_package} not found in Firebase config."
+                  f"Package '{expected_package}' was not found in google-services.json."
               )
 
-          print("Firebase Android configuration validated.")
+          print("Firebase Android config validated successfully.")
           PYTHON
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -144,11 +144,9 @@ jobs:
 
           if [ -f "$PROJECT_DIR/gradlew" ]; then
             chmod +x "$PROJECT_DIR/gradlew"
-            "$PROJECT_DIR/gradlew" \
-              -p "$PROJECT_DIR" testDebugUnitTest --no-daemon
+            "$PROJECT_DIR/gradlew" -p "$PROJECT_DIR" testDebugUnitTest --no-daemon
           else
-            gradle -p "$PROJECT_DIR" \
-              testDebugUnitTest --no-daemon
+            gradle -p "$PROJECT_DIR" testDebugUnitTest --no-daemon
           fi
 
       - name: Build Debug and Release APKs
@@ -157,12 +155,9 @@ jobs:
           set -euo pipefail
 
           if [ -f "$PROJECT_DIR/gradlew" ]; then
-            "$PROJECT_DIR/gradlew" \
-              -p "$PROJECT_DIR" \
-              assembleDebug assembleRelease --no-daemon
+            "$PROJECT_DIR/gradlew" -p "$PROJECT_DIR" assembleDebug assembleRelease --no-daemon
           else
-            gradle -p "$PROJECT_DIR" \
-              assembleDebug assembleRelease --no-daemon
+            gradle -p "$PROJECT_DIR" assembleDebug assembleRelease --no-daemon
           fi
 
           DEBUG_APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
@@ -172,17 +167,15 @@ jobs:
             echo "::error::Debug APK was not generated."
             exit 1
           fi
-
           if [ ! -s "$RELEASE_APK" ]; then
             echo "::error::Release APK was not generated."
             exit 1
           fi
 
-          echo "Both APKs were generated."
           ls -lh "$DEBUG_APK" "$RELEASE_APK"
 
       - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: maxim-debug-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
@@ -190,7 +183,7 @@ jobs:
           retention-days: 14
 
       - name: Upload Release APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: maxim-release-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/app-release.apk
@@ -206,7 +199,6 @@ jobs:
 
           APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
           cp "$APK" maxim.apk
-
           TAG="v${GITHUB_RUN_NUMBER}"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -214,19 +206,21 @@ jobs:
           else
             gh release create "$TAG" maxim.apk \
               --title "Maxim APK ${GITHUB_RUN_NUMBER}" \
-              --notes "Android APK built by GitHub Actions."
+              --notes "Maxim Android APK built by GitHub Actions."
           fi
 
   deploy-hosting:
     name: Deploy Firebase Hosting
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Extract and validate Firebase Hosting project
+      - name: Extract and validate Firebase Hosting config
         shell: bash
         run: |
           set -euo pipefail
@@ -239,11 +233,9 @@ jobs:
           mkdir -p project
           unzip -q -o "$ARCHIVE_NAME" -d project
 
-          FIREBASE_CONFIG="$(find project -type f \
-            -name firebase.json -print -quit)"
-
+          FIREBASE_CONFIG="$(find project -type f -name firebase.json -print -quit)"
           if [ -z "$FIREBASE_CONFIG" ]; then
-            echo "::error::firebase.json not found in ZIP."
+            echo "::error::firebase.json was not found in the ZIP."
             exit 1
           fi
 
@@ -251,23 +243,27 @@ jobs:
           FIREBASERC="$FIREBASE_DIR/.firebaserc"
 
           if [ ! -s "$FIREBASERC" ]; then
-            echo "::error::.firebaserc not found beside firebase.json."
+            echo "::error::.firebaserc was not found beside firebase.json."
             exit 1
           fi
 
-          python3 - "$FIREBASE_CONFIG" "$FIREBASERC" \
-            "$FIREBASE_DIR" "$FIREBASE_PROJECT_ID" <<'PYTHON'
+          python3 - "$FIREBASE_CONFIG" "$FIREBASERC" "$FIREBASE_DIR" "$FIREBASE_PROJECT_ID" <<'PYTHON'
           import json
           import os
           import sys
 
           config_path, rc_path, base_dir, expected_project = sys.argv[1:]
-
           with open(config_path, encoding="utf-8") as f:
               config = json.load(f)
-
           with open(rc_path, encoding="utf-8") as f:
               rc = json.load(f)
+
+          default_project = rc.get("projects", {}).get("default")
+          if default_project and default_project != expected_project:
+              raise SystemExit(
+                  f".firebaserc default project is '{default_project}', "
+                  f"but workflow targets '{expected_project}'."
+              )
 
           hosting = config.get("hosting")
           if isinstance(hosting, dict):
@@ -275,76 +271,59 @@ jobs:
           elif isinstance(hosting, list) and hosting:
               entries = hosting
           else:
-              raise SystemExit(
-                  "firebase.json has no valid Hosting configuration."
-              )
+              raise SystemExit("firebase.json has no valid Hosting configuration.")
 
           for entry in entries:
               public_dir = entry.get("public") if isinstance(entry, dict) else None
               if not public_dir:
-                  raise SystemExit(
-                      "Each Hosting configuration must define 'public'."
-                  )
+                  raise SystemExit("Each Hosting configuration must define 'public'.")
 
-              full_path = os.path.abspath(
-                  os.path.join(base_dir, public_dir)
-              )
-
+              full_path = os.path.abspath(os.path.join(base_dir, public_dir))
+              index_file = os.path.join(full_path, "index.html")
               if not os.path.isdir(full_path):
-                  raise SystemExit(
-                      f"Hosting public directory does not exist: {full_path}"
-                  )
+                  raise SystemExit(f"Hosting public directory missing: {full_path}")
+              if not os.path.isfile(index_file) or os.path.getsize(index_file) == 0:
+                  raise SystemExit(f"Hosting index.html missing or empty: {index_file}")
 
-              if not any(os.scandir(full_path)):
-                  raise SystemExit(
-                      f"Hosting public directory is empty: {full_path}"
-                  )
-
-          aliases = rc.get("projects", {})
-          default_project = aliases.get("default")
-
-          print(f"Target Firebase project: {expected_project}")
-          print(f".firebaserc default alias: {default_project}")
-          print("Hosting configuration validated.")
+          print(f"Hosting configuration validated for project {expected_project}.")
           PYTHON
 
           echo "FIREBASE_DIR=$FIREBASE_DIR" >> "$GITHUB_ENV"
-          echo "Firebase config: $FIREBASE_CONFIG"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - name: Authenticate to Google Cloud / Firebase
+        uses: google-github-actions/auth@v3
         with:
           project_id: maxim-calc
           credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_MAXIM_CALC }}
+          export_environment_variables: true
+          create_credentials_file: true
 
       - name: Install Firebase CLI
         shell: bash
         run: npm install --global firebase-tools
 
-      - name: Check Firebase access
+      - name: Show Firebase CLI version
         shell: bash
-        run: |
-          set -euo pipefail
+        run: firebase --version
 
-          firebase projects:list --non-interactive
-
+      # Deliberately do not run `firebase projects:list` here:
+      # listing every project is not necessary for a direct Hosting deploy.
       - name: Deploy Firebase Hosting
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$FIREBASE_DIR"
 
-          echo "Deploying Firebase Hosting to $FIREBASE_PROJECT_ID"
-
+          echo "Deploying Firebase Hosting directly to $FIREBASE_PROJECT_ID..."
           firebase deploy \
             --only hosting \
             --project "$FIREBASE_PROJECT_ID" \
-            --non-interactive
+            --non-interactive \
+            --debug
 
-          echo "Firebase Hosting deployment completed."
+          echo "Firebase Hosting deploy command completed successfully."
