@@ -1,4 +1,4 @@
-name: Build APK and Deploy Firebase Hosting
+name: Build APK and Deploy Firebase Backend + Hosting
 
 on:
   push:
@@ -34,31 +34,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ ! -s "$ARCHIVE_NAME" ]; then
             echo "::error::Missing $ARCHIVE_NAME in repository root."
             exit 1
           fi
-
           mkdir -p project
           unzip -q -o "$ARCHIVE_NAME" -d project
-
-          SETTINGS_FILE="$(find project -type f \
-            \( -name settings.gradle -o -name settings.gradle.kts \) \
-            -print -quit)"
-
+          SETTINGS_FILE="$(find project -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
           if [ -z "$SETTINGS_FILE" ]; then
             echo "::error::Gradle settings file was not found in the ZIP."
-            find project -maxdepth 5 -type f | sort | head -200
             exit 1
           fi
-
           PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
           if [ ! -d "$PROJECT_DIR/app" ]; then
             echo "::error::Android app directory not found: $PROJECT_DIR/app"
             exit 1
           fi
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Android project found: $PROJECT_DIR"
 
@@ -66,59 +57,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           TARGET="$PROJECT_DIR/app/google-services.json"
           mkdir -p "$(dirname "$TARGET")"
-
           if [ ! -s "$TARGET" ]; then
-            SOURCE="$(find . -type f -name google-services.json \
-              -not -path './.git/*' \
-              -not -path "$TARGET" \
-              -print -quit || true)"
-
+            SOURCE="$(find . -type f -name google-services.json -not -path './.git/*' -not -path "$TARGET" -print -quit || true)"
             if [ -n "$SOURCE" ]; then
               cp "$SOURCE" "$TARGET"
             else
-              INNER="$(unzip -Z1 "$ARCHIVE_NAME" \
-                | grep -E '(^|/)google-services\.json$' \
-                | head -n 1 || true)"
-
+              INNER="$(unzip -Z1 "$ARCHIVE_NAME" | grep -E '(^|/)google-services\.json$' | head -n 1 || true)"
               if [ -z "$INNER" ]; then
                 echo "::error::google-services.json was not found."
                 exit 1
               fi
-
               unzip -p "$ARCHIVE_NAME" "$INNER" > "$TARGET"
             fi
           fi
-
           python3 -m json.tool "$TARGET" >/dev/null
           python3 - "$TARGET" "$FIREBASE_PROJECT_ID" "$ANDROID_PACKAGE_NAME" <<'PYTHON'
-          import json
-          import sys
-
+          import json, sys
           path, expected_project, expected_package = sys.argv[1:]
           with open(path, encoding="utf-8") as f:
               config = json.load(f)
-
           actual_project = config.get("project_info", {}).get("project_id")
           if actual_project != expected_project:
-              raise SystemExit(
-                  f"Expected Firebase project '{expected_project}', "
-                  f"but google-services.json contains '{actual_project}'."
-              )
-
-          packages = [
-              client.get("client_info", {})
-                    .get("android_client_info", {})
-                    .get("package_name")
-              for client in config.get("client", [])
-          ]
+              raise SystemExit(f"Expected Firebase project '{expected_project}', but google-services.json contains '{actual_project}'.")
+          packages = [c.get("client_info", {}).get("android_client_info", {}).get("package_name") for c in config.get("client", [])]
           if expected_package not in packages:
-              raise SystemExit(
-                  f"Package '{expected_package}' was not found in google-services.json."
-              )
-
+              raise SystemExit(f"Package '{expected_package}' was not found in google-services.json.")
           print("Firebase Android config validated successfully.")
           PYTHON
 
@@ -141,7 +106,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -f "$PROJECT_DIR/gradlew" ]; then
             chmod +x "$PROJECT_DIR/gradlew"
             "$PROJECT_DIR/gradlew" -p "$PROJECT_DIR" testDebugUnitTest --no-daemon
@@ -153,25 +117,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -f "$PROJECT_DIR/gradlew" ]; then
             "$PROJECT_DIR/gradlew" -p "$PROJECT_DIR" assembleDebug assembleRelease --no-daemon
           else
             gradle -p "$PROJECT_DIR" assembleDebug assembleRelease --no-daemon
           fi
-
           DEBUG_APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
           RELEASE_APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
-
-          if [ ! -s "$DEBUG_APK" ]; then
-            echo "::error::Debug APK was not generated."
-            exit 1
-          fi
-          if [ ! -s "$RELEASE_APK" ]; then
-            echo "::error::Release APK was not generated."
-            exit 1
-          fi
-
+          [ -s "$DEBUG_APK" ] || { echo "::error::Debug APK was not generated."; exit 1; }
+          [ -s "$RELEASE_APK" ] || { echo "::error::Release APK was not generated."; exit 1; }
           ls -lh "$DEBUG_APK" "$RELEASE_APK"
 
       - name: Upload Debug APK
@@ -196,23 +150,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
           cp "$APK" maxim.apk
           TAG="v${GITHUB_RUN_NUMBER}"
-
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" maxim.apk --clobber
           else
-            gh release create "$TAG" maxim.apk \
-              --title "Maxim APK ${GITHUB_RUN_NUMBER}" \
-              --notes "Maxim Android APK built by GitHub Actions."
+            gh release create "$TAG" maxim.apk --title "Maxim APK ${GITHUB_RUN_NUMBER}" --notes "Maxim Android APK built by GitHub Actions."
           fi
 
-  deploy-hosting:
-    name: Deploy Firebase Hosting
+  deploy-firebase:
+    name: Deploy Firebase Cloud Functions, Firestore Rules and Hosting
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
 
@@ -220,74 +170,55 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Extract and validate Firebase Hosting config
+      - name: Extract and validate Firebase project
         shell: bash
         run: |
           set -euo pipefail
-
           if [ ! -s "$ARCHIVE_NAME" ]; then
             echo "::error::Missing $ARCHIVE_NAME in repository root."
             exit 1
           fi
-
           mkdir -p project
           unzip -q -o "$ARCHIVE_NAME" -d project
-
           FIREBASE_CONFIG="$(find project -type f -name firebase.json -print -quit)"
           if [ -z "$FIREBASE_CONFIG" ]; then
             echo "::error::firebase.json was not found in the ZIP."
             exit 1
           fi
-
           FIREBASE_DIR="$(dirname "$FIREBASE_CONFIG")"
           FIREBASERC="$FIREBASE_DIR/.firebaserc"
-
-          if [ ! -s "$FIREBASERC" ]; then
-            echo "::error::.firebaserc was not found beside firebase.json."
-            exit 1
-          fi
-
+          FUNCTIONS_DIR="$FIREBASE_DIR/functions"
+          [ -s "$FIREBASERC" ] || { echo "::error::.firebaserc was not found beside firebase.json."; exit 1; }
+          [ -s "$FUNCTIONS_DIR/package.json" ] || { echo "::error::functions/package.json is missing."; exit 1; }
+          [ -s "$FUNCTIONS_DIR/index.js" ] || { echo "::error::functions/index.js is missing."; exit 1; }
+          [ -s "$FIREBASE_DIR/firestore.rules" ] || { echo "::error::firestore.rules is missing."; exit 1; }
           python3 - "$FIREBASE_CONFIG" "$FIREBASERC" "$FIREBASE_DIR" "$FIREBASE_PROJECT_ID" <<'PYTHON'
-          import json
-          import os
-          import sys
-
+          import json, os, sys
           config_path, rc_path, base_dir, expected_project = sys.argv[1:]
-          with open(config_path, encoding="utf-8") as f:
-              config = json.load(f)
-          with open(rc_path, encoding="utf-8") as f:
-              rc = json.load(f)
-
+          with open(config_path, encoding="utf-8") as f: config = json.load(f)
+          with open(rc_path, encoding="utf-8") as f: rc = json.load(f)
           default_project = rc.get("projects", {}).get("default")
-          if default_project and default_project != expected_project:
-              raise SystemExit(
-                  f".firebaserc default project is '{default_project}', "
-                  f"but workflow targets '{expected_project}'."
-              )
-
+          if default_project != expected_project:
+              raise SystemExit(f".firebaserc default project is '{default_project}', expected '{expected_project}'.")
+          functions = config.get("functions")
+          if not isinstance(functions, dict) or not functions.get("source"):
+              raise SystemExit("firebase.json must define functions.source.")
+          functions_path = os.path.abspath(os.path.join(base_dir, functions["source"]))
+          if not os.path.isdir(functions_path):
+              raise SystemExit(f"Functions source directory missing: {functions_path}")
           hosting = config.get("hosting")
-          if isinstance(hosting, dict):
-              entries = [hosting]
-          elif isinstance(hosting, list) and hosting:
-              entries = hosting
-          else:
-              raise SystemExit("firebase.json has no valid Hosting configuration.")
-
+          entries = [hosting] if isinstance(hosting, dict) else hosting if isinstance(hosting, list) else []
+          if not entries: raise SystemExit("firebase.json has no valid Hosting configuration.")
           for entry in entries:
               public_dir = entry.get("public") if isinstance(entry, dict) else None
-              if not public_dir:
-                  raise SystemExit("Each Hosting configuration must define 'public'.")
-
+              if not public_dir: raise SystemExit("Each Hosting configuration must define 'public'.")
               full_path = os.path.abspath(os.path.join(base_dir, public_dir))
               index_file = os.path.join(full_path, "index.html")
-              if not os.path.isdir(full_path):
-                  raise SystemExit(f"Hosting public directory missing: {full_path}")
+              if not os.path.isdir(full_path): raise SystemExit(f"Hosting public directory missing: {full_path}")
               if not os.path.isfile(index_file) or os.path.getsize(index_file) == 0:
                   raise SystemExit(f"Hosting index.html missing or empty: {index_file}")
-
-          print(f"Hosting configuration validated for project {expected_project}.")
+          print(f"Firebase configuration validated for {expected_project}.")
           PYTHON
-
           echo "FIREBASE_DIR=$FIREBASE_DIR" >> "$GITHUB_ENV"
 
       - name: Set up Node.js
@@ -303,27 +234,30 @@ jobs:
           export_environment_variables: true
           create_credentials_file: true
 
-      - name: Install Firebase CLI
+      - name: Install Firebase CLI and Functions dependencies
         shell: bash
-        run: npm install --global firebase-tools
+        run: |
+          set -euo pipefail
+          npm install --global firebase-tools
+          cd "$FIREBASE_DIR/functions"
+          npm install --omit=dev
 
-      - name: Show Firebase CLI version
+      - name: Verify required quota functions exist in source
         shell: bash
-        run: firebase --version
+        run: |
+          set -euo pipefail
+          grep -q 'getQuotaStatus' "$FIREBASE_DIR/functions/index.js" || { echo "::error::getQuotaStatus is missing from functions/index.js"; exit 1; }
+          grep -q 'consumeFreeCalculation' "$FIREBASE_DIR/functions/index.js" || { echo "::error::consumeFreeCalculation is missing from functions/index.js"; exit 1; }
+          firebase --version
 
-      # Deliberately do not run `firebase projects:list` here:
-      # listing every project is not necessary for a direct Hosting deploy.
-      - name: Deploy Firebase Hosting
+      - name: Deploy Firebase backend and Hosting
         shell: bash
         run: |
           set -euo pipefail
           cd "$FIREBASE_DIR"
-
-          echo "Deploying Firebase Hosting directly to $FIREBASE_PROJECT_ID..."
+          echo "Deploying Cloud Functions, Firestore Rules and Hosting to $FIREBASE_PROJECT_ID..."
           firebase deploy \
-            --only hosting \
+            --only functions,firestore:rules,hosting \
             --project "$FIREBASE_PROJECT_ID" \
-            --non-interactive \
-            --debug
-
-          echo "Firebase Hosting deploy command completed successfully."
+            --non-interactive
+          echo "Firebase backend and Hosting deploy completed successfully."
